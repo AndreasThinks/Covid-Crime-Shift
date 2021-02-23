@@ -1,0 +1,1038 @@
+---
+title: "Exploring Local COVID Burglary Crime Effects"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+## Useful Resources
+- Matt Ashby Crime Mapping course: https://github.com/mpjashby/crimemapping/
+- Spatial Modelling for Data Scientists: https://gdsl-ul.github.io/san/
+- R for Data Science: https://r4ds.had.co.nz/index.html
+- Geocomputation with R: https://geocompr.robinlovelace.net/
+
+
+
+## Exploring Predictors of COVID Crime Shifts
+In this notebook, I'll be prediting crime trends in London by MSOA, and looking at where COVID has been most impactive.  I'll then try to find correlates.
+
+#### Tasks
+1. Read all burglary and robbery data - 2018 onwards
+2. Assign to MSOA
+3. Predict trend by MSOA
+4. Identify error by MSOA
+5. Visualise and model
+
+```{r}
+# Data manipulation, transformation and visualisation
+library(tidyverse)
+# Nice tables
+library(kableExtra)
+# Simple features (a standardised way to encode vector data ie. points, lines, polygons)
+library(sf) 
+# Spatial objects conversion
+library(sp) 
+# Thematic maps
+library(tmap) 
+# Colour palettes
+library(RColorBrewer) 
+# More colour palettes
+library(viridis)
+
+library(raster)  # raster data
+library(rgdal)  # input/output, projections
+library(rgeos)  # geometry ops
+library(spdep)  # spatial dependence
+
+library(Metrics)
+library(caret)
+
+```
+One of the first things I notice is that while Python code is generally quite careful about imports, here we globally import everything...which is nice, but I'm also not quite clear which functions are coming from which libraries.
+
+Now, let's import all our crime data. Let's start by one dataframe before figuring how to automate and concatenate.  Notice R uses slashes that are the otehr way to Python and Windows
+
+```{r}
+test_df <- read.csv("crimes/2018-01/2018-01-metropolitan-street.csv")
+test_df
+
+```
+Let's look at all the unique crime types.  Notice how we have a similar to the "unique" method in Python, and access a specific function using the same syntax.  
+
+```{r}
+unique(test_df["Crime.type"])
+```
+To avoid this getting particularly computationally intensive, let's write a function to pull out robberies and burglaries, and assign them a specific MSOA. Then we can iterate over all our months and get monthly counts for each offence type.
+
+```{r}
+subset_df <- filter(test_df, Crime.type=="Burglary" | Crime.type=="Robbery")
+subset_df
+```
+Weirdly, here I *don't* need quotation marks for my colum name...not sure what's driving that. But it's easy to select a subset by column, and use logical comparators.
+
+With that in mind, let's now read our MSOA borders and assign these to an MSOA. I've set the OSGB CRS code as it doesn't seem to automatically assign it.
+
+```{r}
+lsoa_borders <- st_read("msoa_borders/MSOA_2011_London_gen_MHW.tab", crs=27700)
+lsoa_borders
+
+```
+Notice that when you're reading a frame that isn't "tidy", it's messy as hell - this is a geodataframe.  Makes me miss the elegance of Geopandas somewhat. Still, it's easy to import, and you get pretty plots. Given MOPAC data is in national grid, we're also going to have to re-project this. 
+
+It's also very easy to plot.
+
+```{r}
+plot(lsoa_borders)
+```
+ No idea why it wants that much white space though....
+ 
+ Now, let's reproject and do a spatial join to assign all of my crimes to an MSOA. Given we're working on London, let's change change everything to that. We'll start by changing my crime dataframe, that currently has latitude and longitudes as just numbers, to a spatial dataframe with coordinates
+```{r}
+
+'subset_spatial <- st_as_sf(subset_df, coords = c("Longitude", "Latitude"), 
+                      crs = 4326, remove = FALSE)
+
+subset_spatial'
+
+```
+
+Ah, we have missing values.  Time to learn how to drop those.
+
+In Pandas, we have easy functions to "drop_na" and "is_na" - I'm hoping to quickly find equivalents.  My favourite Python approach to this is df.isna().sum(), counting how many "true" values you have when filtering like that.  Can we duplicate that process?
+
+```{r}
+sum(is.na(subset_df["Longitude"]))
+```
+```{r}
+sum(is.na(subset_df["Latitude"]))
+```
+
+We can!  Glorious.  We have 82 missing coordinates.  Let's drop all those rows.
+
+```{r}
+clean_df <- subset_df[!rowSums(is.na(subset_df["Longitude"])), ]
+clean_df
+```
+Annoyingly, while R does have a drop_na function, it doesn't take a "subset" argument like Python, which means this slightly painful fudge.
+
+We should now be able to form our spatial df.
+
+```{r}
+
+subset_spatial <- st_as_sf(clean_df, coords = c("Longitude", "Latitude"), 
+                      crs = 4326, remove = FALSE)
+
+subset_spatial
+```
+
+
+```{r}
+plot(subset_spatial)
+```
+Success! That looks faintly promising.  Now, let's figure out how to re-project.
+
+```{r}
+
+latlong = "+init=epsg:4326"
+ukgrid = "+init=epsg:27700"
+
+```
+
+```{r}
+subset_osgb <- st_transform(subset_spatial, ukgrid)
+subset_osgb
+```
+
+Error messages in R are  definitely harder to digest for me so far...I'm hoping that will pass with time. I'm also finding the documentation slightly harder to figure out, with fewer worked examples. Still, so far, so easily translateable! Now, let's spatial join this up.
+
+
+
+```{r}
+crime_with_msoa <- st_join(subset_osgb, lsoa_borders["MSOA11CD"])
+crime_with_msoa
+```
+That looks like it worked - it defaults to a left join.  Now, let's group by offence type and MSOA, so as to get a count of robbery and burglary per MSOA for this month.  We should then have all the code we need to create our function.
+
+```{r}
+msoa_list<- crime_with_msoa %>%
+  group_by(MSOA11CD, Crime.type) %>%
+  summarize(count_by_msoa = n())
+
+msoa_list
+```
+It works!  We'll need to fill every missing value with 0, drop the geometry column, and then repeat the process for every month, and then we're in business.
+
+We'll have to check for any values that aren't MSOAs that aren't present, and if they're not, add a 0. I'm going to do this for robbery and burglary independently.
+
+```{r}
+class(msoa_list)
+
+```
+We need to remove the geometry column.  Currently, our object is a spatial dataframe (sf) and a tibble (a tidyverse specific dataframe type) which is stopping me from removing the geometry data.
+
+```{r}
+msoa_pivot_tibble <- as_tibble(msoa_list)
+msoa_pivot_tibble
+```
+```{r}
+class(msoa_pivot_tibble)
+```
+We've now removed the spatial frame function, and should be able to drop the last column (geometry.)
+```{r}
+msoa_pivot_tibble <- msoa_pivot_tibble[0:3]
+msoa_pivot_tibble
+```
+We now need to fill our missing values.  Rather than iterate or similar, I'll just add an entire df filled with 0s for both crime types, then drop any duplicates - at least, that's how I'd do it in Python, and shall try to do here!
+
+```{r}
+#creating a df with all msoa names, for robbery and burglary
+msoa_zero_df_robbery <- unique(as_tibble(lsoa_borders)["MSOA11CD"])
+msoa_zero_df_burglary <- unique(as_tibble(lsoa_borders)["MSOA11CD"])
+
+#adding our crime type column 
+msoa_zero_df_burglary["Crime.type"] = "Burglary"
+msoa_zero_df_robbery["Crime.type"] = "Robbery"
+
+#Creating a "count" column identical to our pivot, and filling it with 0
+msoa_zero_df_burglary["count_by_msoa"] = as.numeric(0)
+msoa_zero_df_robbery["count_by_msoa"] = as.numeric(0)
+
+msoa_zero_df_robbery
+```
+I'm a little worried about the "dbl" class, but let's ignore that for now.  Now, we need to concatenate both, and add them to our MSOA pivot.
+
+```{r}
+duplicate_concat <- rbind(msoa_zero_df_robbery, msoa_zero_df_burglary)
+duplicate_concat
+```
+
+It seems to have worked.  That said, the fact there is no clear function for concatenation (in contrast to pd.concatenate in Pandas) surprises me.  Now, let's finally concatenate everything, and remove duplicates.  That should form our final monthly df, and we can then combine all our previous steps into a function.
+
+```{r}
+
+df_with_dups <- rbind(msoa_pivot_tibble, duplicate_concat)
+
+df_with_dups
+```
+It's noticeable how much harder finding documentation is for R than Pandas - while the drop_duplicates function is front and center for any searches in Python, a similar search in R reveals plenty of hacky filters,  but the "distinct" function seems to be what I'm actually looking for.
+```{r}
+#creating a filter for duplicates columns, which should ignore the first instance
+dup_filters <- duplicated(df_with_dups[0:2])
+
+
+monthly_df <- filter(df_with_dups, !dup_filters)
+monthly_df
+```
+That should now be all our values.  As a sanity check, let's make sure we have the right number of rows, using R's "dim" function (equivalent to shape in Pandas) to check how many unique values we would expect.
+```{r}
+dim(unique(as_tibble(lsoa_borders)["MSOA11CD"]))[1] * 2
+```
+We've got 2 extra...a bit weird, but not end of world.  Let's leave it at that.
+
+We now need to add our monthly date to this dataframe
+
+```{r}
+#select the first unique value of months in the original dataframe
+month <- unique(test_df["Month"])[1,1]
+monthly_df["Month"] <- month
+monthly_df
+```
+Now, let's bring all our previous work together into a function (and fix my awkward prior msoa/lsoa typo)
+
+```{r}
+#quick initial function to generate our MSOA borde spatial frame, to avoid it sitting in the initial frame and gobbling loads of memory.
+generate_msoa_borders <- function(file){
+  msoa_borders <- st_read(file, crs=27700)
+  return(msoa_borders)
+}
+
+make_month_pivot <- function(file){
+  #define our CRS
+  latlong = "+init=epsg:4326"
+  ukgrid = "+init=epsg:27700"
+  #read our crime from the file
+  test_df <- read.csv(file)
+  #select only our target crime types
+  subset_df <- filter(test_df, Crime.type=="Burglary" | Crime.type=="Robbery")
+  #remove any rows with a long/lat coordinate
+  clean_df <- subset_df[!rowSums(is.na(subset_df["Longitude"])), ]
+  #generate a spatial df
+  subset_spatial <- st_as_sf(clean_df, coords = c("Longitude", "Latitude"), 
+                      crs = 4326, remove = FALSE)
+  #reproject to uk grid coords
+  subset_osgb <- st_transform(subset_spatial, ukgrid)
+  #spatially join to assign to an MSOA
+  crime_with_msoa <- st_join(subset_osgb, msoa_borders["MSOA11CD"])
+  #summarise by count of MSOA
+  msoa_list<- crime_with_msoa %>%
+    group_by(MSOA11CD, Crime.type) %>%
+    summarize(count_by_msoa = n())
+  #return to a non-geographic msoa
+  msoa_pivot_tibble <- as_tibble(msoa_list)
+  msoa_pivot_tibble <- msoa_pivot_tibble[0:3]
+  #creating a df with all msoa names, for robbery and burglary
+  msoa_zero_df_robbery <- unique(as_tibble(msoa_borders)["MSOA11CD"])
+  msoa_zero_df_burglary <- unique(as_tibble(msoa_borders)["MSOA11CD"])
+  #adding our crime type column 
+  msoa_zero_df_burglary["Crime.type"] = "Burglary"
+  msoa_zero_df_robbery["Crime.type"] = "Robbery"
+  #Creating a "count" column identical to our pivot, and filling it with 0
+  msoa_zero_df_burglary["count_by_msoa"] = as.numeric(0)
+  msoa_zero_df_robbery["count_by_msoa"] = as.numeric(0)
+  duplicate_concat <- rbind(msoa_zero_df_robbery, msoa_zero_df_burglary)
+  df_with_dups <- rbind(msoa_pivot_tibble, duplicate_concat)
+  #creating a filter for duplicates columns, which should ignore the first instance
+  dup_filters <- duplicated(df_with_dups[0:2])
+  monthly_df <- filter(df_with_dups, !dup_filters)
+  #re-add our month column
+  month <- unique(test_df["Month"])[1,1]
+  monthly_df["Month"] <- month
+  return(monthly_df)
+}
+```
+
+We've now got our tooling for a data pipeline ready to go!  We can now run this on every single month of data, and aggregate into a historical combined data-set.
+
+Data.Police.UK comes as a bunch of nested-subdirectories...in hindsight, I probably should have looked at their API, but for now let's power ahead and figure out how to extract a list of all the CSV files in our folder and the various sub-directories.
+
+```{r}
+list.files(path = "crimes")
+
+```
+As we suspected, the nested directories cause an issue - guess we're going to have to learn about loops in R!  Let's iterate over our list of subfolders, and re-apply the function to each.
+```{r}
+subfolders <- list.files(path = "crimes")
+file_list <- list()
+for (folder in subfolders){
+  folder_subdir <- "crimes/"
+  #concatenate to get our total subfolder directory - hacky but will work here.
+  sub_path <- paste(folder_subdir, folder, sep="")
+  list.files(sub_path)
+  file_list <- list(file_list, paste(sub_path,"/", list.files(sub_path), sep=""))
+  }
+
+```
+
+
+The bad news is, this totally didn't work. The good news is, it led me to the far cleaner, "recursive" version of the read files function.
+
+```{r}
+list.files(path = "crimes", recursive=T)
+
+```
+First, let's create an empty dataframe we can concatenate all teh rest to.  
+```{r}
+empty_df <- tibble(
+MSOA11CD = "", 
+Crime.type= "",
+count_by_msoa= "",
+Month= ""
+)
+empty_df
+```
+Annoyingly, I don't seem to be able to cr
+```{r}
+msoa_borders <- generate_msoa_borders("msoa_borders/MSOA_2011_London_gen_MHW.tab")
+msoa_borders
+```
+Our MSOA border helper functions seems to work.  Now, time to do the heavy lifting!
+
+
+```{r}
+subfiles <- list.files(path = "crimes", recursive=T)
+
+for (file in subfiles){
+  folder_subdir <- "crimes/"
+  #concatenate to get our total subfolder directory - hacky but will work here.
+  sub_path <- paste(folder_subdir, file, sep="")
+  monthly_df <- make_month_pivot(sub_path)
+  empty_df <- rbind(empty_df, monthly_df)
+}
+
+```
+That seems to have worked! The processing time was longer than I expected (which is probably something to do with how R stores memory) - let's look at our previously empty dataframe.
+```{r}
+empty_df
+```
+
+
+```{r}
+unique(empty_df["Month"])
+```
+
+So we now have a combined dataframe of just under 71,000 rows, for 37 individual months beetween January 2018 and December 2020, for every robbery and burglary in London, assigned to an MSOA.  I'd call that a win!  
+
+This has been somewhat more painful than I expected, so before going any further, let's figure out how to save this file.  Given it's all strings and integers, a simple CSV should do for now.
+
+```{r}
+write.csv(empty_df,"msoa_crime_matrix.csv")
+
+```
+
+## Modelling - Crime Trends by MSOA
+We can now move on to the fun bit - predicting the crime trend we'd expect, and then looking at how much it diverges when we hit the "pandemic disruption" period.
+
+I'll either be using auto-arima or Facebook's prophet algorithm, both of which produce relatively accurate forecasts with little necessary tuning.  I'm hoping 2018 through early 2020 should be sufficient to establish trends and seasonality. We can then use our error rate from March 2020 onwards as a measure of the "pandemic effect".
+
+As a test, let's start by predicting one MSOA: the first in our df, "E02000001"
+
+```{r}
+empty_df <- read.csv("msoa_crime_matrix.csv")
+empty_df <- empty_df[2:70848,2:5]
+empty_df
+```
+
+
+```{r}
+single_msoa_df <- filter(empty_df, MSOA11CD == "E02000001" & Crime.type=="Burglary")
+single_msoa_df
+```
+As we'd expect, 36 rows for 36 months.  Let's covert those rows to a date, and start making predictions.
+
+```{r}
+single_msoa_df$DateString <- paste(single_msoa_df$Month, "-01")
+single_msoa_df
+
+```
+Converting these to dates was harder than I'd anticipated, but the Tidyverse ecosystem does have some nifty tools! 
+
+```{r}
+library(lubridate)
+
+single_msoa_df$DateClean <- ymd(single_msoa_df$DateString)
+single_msoa_df
+```
+Let's now build our "pre-pandemic" training set, up to February 2020, and use prophet to make some predictions.
+
+```{r}
+
+training_set <- filter(single_msoa_df, DateClean < "2020-03-01")
+training_set
+
+```
+```{r}
+training_df <- tibble(
+  ds=training_set$DateClean,
+  y=training_set$count_by_msoa
+)
+training_df
+```
+We can now instantiate our prophet model, and start making predictions.
+
+```{r}
+library(prophet)
+m <- prophet(training_df)
+
+```
+We'll predict for a period of around 3 months  and then compare to what actually happened.
+```{r}
+future <- make_future_dataframe(m, periods = 6, freq = 'month')
+tail(future)
+```
+Let's get forecasting
+```{r}
+
+forecast <- predict(m, future)
+tail(forecast[c('ds', 'yhat', 'yhat_lower', 'yhat_upper')])
+
+```
+
+```{r}
+# R
+plot(m, forecast)
+
+```
+```{r}
+♠# R
+prophet_plot_components(m, forecast)
+```
+These predictions obviously look a little silly, but the yearly trend (which is what we really wanted to get out of this) doesn't look mad to me. I'm hoping that using all our MSOA in aggregate, we'll get meaningful data.  Firstly, we need to get our error rate.
+
+```{r}
+
+head(forecast)
+
+forecast$Month <- month(forecast$ds)
+forecast$Year <- year(forecast$ds)
+
+forecast
+
+```
+
+To do next.
+
+Group prediction by month
+We'll look at April and May, which were "peak" London COVID effect
+```{r}
+forecast
+```
+
+```{r}
+this_year <- filter(forecast, Year > 2019)
+peak_pandemic <- filter(this_year, Month== 4 | Month== 5 )
+peak_pandemic
+```
+
+```{r}
+predictionPivot <- peak_pandemic %>%
+  group_by(Month) %>%
+  summarize(predicted_burglary = mean(yhat))
+
+predictionPivot
+
+```
+Now, let's compare that to our ACTUAL data, and get an error rate.
+
+```{r}
+
+
+
+single_msoa_df$MonthNum <- month(single_msoa_df$DateClean)
+single_msoa_df$YearNum <- year(single_msoa_df$DateClean)
+
+this_year_actual <- filter(single_msoa_df, YearNum > 2019)
+peak_pandemic_actual <- filter(this_year_actual, MonthNum== 4 | MonthNum== 5 )
+peak_pandemic_actual
+```
+
+As such, our model anticipated around 18 burglaries during this period, while in reality, there was 1. This is the measure of our "covid error" for the MSOA.  Let's get that measure into a percentage error as well as absolute error, and then we can repeat the process for all of London
+
+```{r}
+actual_burglary <- sum(peak_pandemic_actual$count_by_msoa)
+pred_burglary <- sum(predictionPivot$predicted_burglary)
+
+error <- actual_burglary - pred_burglary
+percentage_error <- error / pred_burglary 
+
+print("Burglary Count")
+print(actual_burglary)
+print("Predicted")
+print(pred_burglary)
+
+print("Actual Error")
+print(error)
+print("Percentage Error")
+print(percentage_error)
+```
+Now, let's automate. Similar to our previous process, we'll create a dataframe for every MSOA, and both types, then run a for loop repeating our process across London.
+```{r}
+
+
+msoa_error_tibble <- tibble(
+MSOA11CD = "", 
+burglaryActual= "",
+burglaryPredicted= "",
+burglaryError= "",
+burglaryPercentError="",
+robberyActual= "",
+robberyPredicted= "",
+robberyError= "",
+robberyPercentError=""
+)
+
+msoa_error_tibble
+```
+
+```{r}
+calculate_error <- function(msoaName){
+  #select only burglary and our msoa
+  single_msoa_df <- filter(empty_df, MSOA11CD == msoaName & Crime.type=="Burglary")
+  #clean date date
+  single_msoa_df$DateString <- paste(single_msoa_df$Month, "-01")
+  single_msoa_df$DateClean <- ymd(single_msoa_df$DateString)
+  #generate training set up until March
+  training_set <- filter(single_msoa_df, DateClean < "2020-03-01")
+  #prepare for Prophet
+  training_df <- tibble(
+    ds=training_set$DateClean,
+    y=training_set$count_by_msoa)
+  #start and predict prophet for 6 months
+  m <- prophet(training_df)
+  future <- make_future_dataframe(m, periods = 6, freq = 'month')
+  forecast <- predict(m, future)
+  forecast$Month <- month(forecast$ds)
+  forecast$Year <- year(forecast$ds)
+  #aggregate forecasts and actual crime
+  this_year <- filter(forecast, Year > 2019)
+  peak_pandemic <- filter(this_year, Month== 4 | Month== 5 )
+  predictionPivot <- peak_pandemic %>%
+    group_by(Month) %>%
+    summarize(predicted_burglary = mean(yhat))
+
+  single_msoa_df$MonthNum <- month(single_msoa_df$DateClean)
+  single_msoa_df$YearNum <- year(single_msoa_df$DateClean)
+  #generate error rates
+  this_year_actual <- filter(single_msoa_df, YearNum > 2019)
+  peak_pandemic_actual <- filter(this_year_actual, MonthNum== 4 | MonthNum== 5 )
+  actual_burglary <- sum(peak_pandemic_actual$count_by_msoa)
+  pred_burglary <- sum(predictionPivot$predicted_burglary)
+  error_burg <- actual_burglary - pred_burglary
+  percentage_error_burg <- error_burg / pred_burglary 
+  
+  #now repeat for robbery
+  
+  single_msoa_df <- filter(empty_df, MSOA11CD == msoaName & Crime.type=="Robbery")
+  single_msoa_df$DateString <- paste(single_msoa_df$Month, "-01")
+  single_msoa_df$DateClean <- ymd(single_msoa_df$DateString)
+  training_set <- filter(single_msoa_df, DateClean < "2020-03-01")
+  training_df <- tibble(
+    ds=training_set$DateClean,
+    y=training_set$count_by_msoa)
+  m <- prophet(training_df)
+  future <- make_future_dataframe(m, periods = 6, freq = 'month')
+  forecast <- predict(m, future)
+  forecast$Month <- month(forecast$ds)
+  forecast$Year <- year(forecast$ds)
+  this_year <- filter(forecast, Year > 2019)
+  peak_pandemic <- filter(this_year, Month== 4 | Month== 5 )
+  predictionPivot <- peak_pandemic %>%
+    group_by(Month) %>%
+    summarize(predicted_burglary = mean(yhat))
+
+  single_msoa_df$MonthNum <- month(single_msoa_df$DateClean)
+  single_msoa_df$YearNum <- year(single_msoa_df$DateClean)
+
+  this_year_actual <- filter(single_msoa_df, YearNum > 2019)
+  peak_pandemic_actual <- filter(this_year_actual, MonthNum== 4 | MonthNum== 5 )
+  actual_robbery <- sum(peak_pandemic_actual$count_by_msoa)
+  pred_robbery <- sum(predictionPivot$predicted_burglary)
+  error_rob <- actual_robbery - pred_robbery
+  percentage_error_rob <- error_rob / pred_robbery 
+  
+  #create our output dataframe and return it
+  
+  msoa_error_tibble <- tibble(
+    MSOA11CD = msoaName, 
+    burglaryActual= actual_burglary,
+    burglaryPredicted= pred_burglary,
+    burglaryError= error_burg,
+    burglaryPercentError = percentage_error_burg,
+    robberyActual= actual_robbery,
+    robberyPredicted= pred_robbery,
+    robberyError= error_rob,
+    robberyPercentError=percentage_error_rob
+    )
+
+  return(msoa_error_tibble)
+}
+```
+
+Messy and hacky, but theoretically functional!  Now for the long bit - let's loop over all our MSOAs, and get our aggregate error dataframe.
+
+
+```{r}
+for (msoa in unique(empty_df$MSOA11CD)){
+  iterated_msoa_df <- calculate_error(msoa)
+  msoa_error_tibble <- rbind(msoa_error_tibble, iterated_msoa_df)
+  
+}
+
+```
+```{r}
+msoa_error_tibble
+```
+
+```{r}
+write_csv(msoa_error_tibble, "msoa_error_table.csv")
+```
+
+```{r}
+msoa_error_tibble
+```
+
+```{r}
+msoa_error_tibble[,2:9] <- lapply(msoa_error_tibble[,2:9], as.numeric)
+```
+```{r}
+msoa_error_tibble <- msoa_error_tibble[2:980, ]
+msoa_error_tibble
+```
+
+
+Let's also calculate the "Relative Percentage Difference" (RPD) of our estimates. 
+
+```{r}
+msoa_error_tibble$RPDBurglary <- 2*((msoa_error_tibble$burglaryPredicted - msoa_error_tibble$burglaryActual)/(abs(msoa_error_tibble$burglaryPredicted) + abs(msoa_error_tibble$burglaryActual)))
+
+msoa_error_tibble$RPDRobbery <- 2*((msoa_error_tibble$robberyPredicted - msoa_error_tibble$robberyActual)/(abs(msoa_error_tibble$robberyPredicted) + abs(msoa_error_tibble$robberyActual)))
+```
+
+```{r}
+msoa_error_tibble
+```
+
+
+```{r}
+summary(msoa_error_tibble$RPDBurglary)
+```
+
+```{r}
+hist(msoa_error_tibble$RPDBurglary)
+```
+
+
+Now, let's link all these back to our original geographic dataframe.
+
+```{r}
+lsoa_borders <- st_read("msoa_borders/MSOA_2011_London_gen_MHW.tab", crs=27700)
+lsoa_borders
+
+```
+
+
+```{r}
+geographic_error_map <- left_join(lsoa_borders, msoa_error_tibble, by = "MSOA11CD")
+geographic_error_map
+```
+Let's map both of these metrics, and see what it looks like.
+
+```{r}
+# map
+
+burg_map <- tm_shape(geographic_error_map) +
+  tm_fill(col = "RPDRobbery", title = "Robbery Relative Error")
+
+rob_map <-tm_shape(geographic_error_map) +
+  tm_fill(col = "RPDBurglary", title = "Burglary Relative Error")
+
+tmap_arrange(burg_map, rob_map)
+
+
+```
+As a final part of this project, I'm going to explore some geographic modelling. Let's start with linking our current data with the London MOPAC MSOA Atlas, which should provide a whole bunch of useful demographic and economic data.  I've slightly modified it in Excel to get rid of the weird header structure.
+
+```{r}
+library(readxl)
+msoa_atlas <- read_excel("msoa_atlas/msoa-data.xls")
+msoa_atlas
+```
+
+Let's do one last spatial join to bring all these things together
+
+```{r}
+geographic_msoa_matrix <- left_join(geographic_error_map, msoa_atlas, by = "MSOA11CD")
+
+```
+
+Let's provide a tible version as well for clear analysis
+
+```{r}
+msoa_matrix_tbl <- as_tibble(geographic_msoa_matrix)
+msoa_matrix_tbl
+```
+Let's look at how correlated our factors are
+
+```{r}
+library(corrr)
+corr_df <- correlate(msoa_matrix_tbl, quiet = TRUE)
+corr_df
+```
+
+Annoyingly, unlike Pandas, R throws up errors here (while Python implicitly gets rid of non-numerical columns - let's clean it up
+
+```{r}
+msoa_matrix_numeric <-dplyr::select_if(msoa_matrix_tbl, is.numeric)
+msoa_matrix_numeric
+```
+
+```{r}
+corr_df <- correlate(dplyr::select_if(msoa_matrix_tbl, is.numeric), quiet = TRUE)
+corr_df
+
+
+```
+Let's now look for correlates of our error rate for burglary and robbery
+
+```{r}
+options(scipen = 999)
+
+
+dplyr::select(corr_df[order(corr_df$RPDRobbery),] , term, RPDRobbery)
+
+```
+
+
+```{r}
+dplyr::select(corr_df[order(corr_df$RPDBurglary),] , term, RPDBurglary)
+```
+There are very few decent correlates in the robbery data - everything is a bit of a mess.  That's not the case in the burglary data however: we might be able to do some modeling here. General deprivation indicators stand out very sharply, correlated to ethnicity.
+
+I'd normally start exploring spatial models and weights, but I think that's a little outside the scope of this first project.  Instead, let's get straight to modeling.
+
+```{r}
+log(msoa_matrix_numeric["Income Deprivation (2010) % living in income deprived households reliant on means tested benefit"])
+```
+```{r}
+msoa_burglary_copy <- msoa_matrix_numeric
+
+names(msoa_burglary_copy)[names(msoa_burglary_copy) == "Income Deprivation (2010) % living in income deprived households reliant on means tested benefit"] <- "hhPercentBenefit"
+
+names(msoa_burglary_copy)[names(msoa_burglary_copy) == "Lone Parents (2011 Census) Lone parents not in employment"] <- "UnempLoneParents"
+
+names(msoa_burglary_copy)[names(msoa_burglary_copy) == "Ethnic Group (2011 Census) Black/African/Caribbean/Black British (%)"] <- "blackPercent"
+
+names(msoa_burglary_copy)[names(msoa_burglary_copy) == "Health (2011 Census) Bad health (%)"] <- "percentBadHealth"
+
+names(msoa_burglary_copy)[names(msoa_burglary_copy) == "Tenure (2011) Owned: Owned outright"] <- "HouseOwned"
+
+```
+
+
+```{r}
+feature_df <- dplyr::select(msoa_burglary_copy, RPDBurglary, hhPercentBenefit, UnempLoneParents, blackPercent, percentBadHealth, HouseOwned, ComEstRes)
+feature_df
+```
+We have a few NA.  Let's get rid of them
+
+```{r}
+feature_df <- drop_na(feature_df, RPDBurglary)
+feature_df
+```
+
+
+```{r}
+ colnames(feature_df)
+```
+```{r}
+colSums(is.na(feature_df))
+```
+
+```{r}
+pairs(feature_df)
+
+```
+
+We are going to want to perform a log transform.  Because our RPD has negative values, we'll need to add a constant before - in thise case, 3 (so everything is positive)
+```{r}
+feature_df$RPDBurglaryTranform <- feature_df$RPDBurglary + 3
+feature_df
+```
+
+
+
+Now, let's produce our log transform columns
+
+```{r}
+for (col in colnames(feature_df)){
+  new_name <- paste("log_", col, sep = "")
+  feature_df[new_name] <- log(feature_df[col])
+}
+```
+
+```{r}
+feature_df[,9:15]
+```
+
+```{r}
+feat_transform_df <- feature_df[,9:14]
+feat_transform_df
+```
+
+```{r}
+pairs(feat_transform_df)
+```
+
+```{r}
+correlate(feat_transform_df)
+```
+
+```{r}
+mod_burglary <- lm(log_RPDBurglaryTranform ~ log_blackPercent + log_hhPercentBenefit , data = feat_transform_df)
+summary(mod_burglary)
+```
+
+```{r}
+mod_burglary <- lm(log_RPDBurglaryTranform ~ log_blackPercent , data = feat_transform_df)
+summary(mod_burglary)
+```
+
+So, we have significance.  It looks like the main driver are general deprivation indicators, but due to correlation, we're struggling to get any more detailed.  Let's use Random Forests to try and dig into this as bit further.
+
+```{r}
+msoa_matrix_numeric
+```
+Once again, let's get rid of NA.  This time, let's do our RPD, and then any columns
+```{r}
+rf_msoa_matrix <- drop_na(msoa_matrix_numeric, RPDBurglary)
+
+rf_msoa_matrix
+```
+
+```{r}
+clean_rf_matrix <- rf_msoa_matrix[ , colSums(is.na(rf_msoa_matrix)) == 0]
+clean_rf_matrix
+```
+Right, we've now got our data good to go, with no NAs. 
+https://towardsdatascience.com/random-forest-in-r-f66adf80ec9
+
+```{r}
+
+library(randomForest)
+require(caTools)
+library(caret)
+```
+```{r}
+clean_rf_matrix
+```
+
+
+```{r}
+drop<- c("burglaryActual","burglaryError","burglaryPercentError","burglaryPredicted","robberyActual","robberyPredicted","robberyError","robberyPercentError","RPDRobbery")
+data<- clean_rf_matrix[,!(names(clean_rf_matrix) %in% drop)]
+data
+```
+
+
+```{r}
+
+sample = sample.split(data$RPDBurglary, SplitRatio = 0.75)
+train = subset(data, sample == TRUE)
+test  = subset(data, sample == FALSE)
+dim(train)
+dim(test)
+```
+```{r}
+rf <- randomForest(
+  RPDBurglary ~ .,
+  data=train
+)
+```
+Annoyingly, because my columns have white spaces, R doesn't like it.
+
+```{r}
+names(clean_rf_matrix)<-make.names(names(clean_rf_matrix),unique = TRUE)
+
+```
+
+
+```{r}
+
+drop<- c("burglaryActual","burglaryError","burglaryPercentError","burglaryPredicted","robberyActual","robberyPredicted","robberyError","robberyPercentError","RPDRobbery")
+data<- clean_rf_matrix[,!(names(clean_rf_matrix) %in% drop)]
+
+
+names(data)<- make.names(names(data),unique = TRUE)
+data
+```
+
+
+```{r}
+sample = sample.split(data$RPDBurglary, SplitRatio = 0.75)
+train = subset(data, sample == TRUE)
+test  = subset(data, sample == FALSE)
+
+
+rf <- randomForest(
+  RPDBurglary ~ .,
+  data=train, 
+  importance=TRUE
+)
+```
+
+```{r}
+summary(rf)
+```
+```{r}
+library(DALEX)
+```
+```{r}
+
+rf_explainer <- explain(rf, data=train, y= train$RPDBurglary)
+```
+
+```{r}
+rf_perf <- model_performance(rf_explainer)
+rf_perf
+```
+```{r}
+help(variable_importance)
+
+
+```
+
+```{r}
+var_importance_ranger_after_vi <- variable_importance(
+  rf_explainer,
+  loss_function = loss_root_mean_square,
+  B = 10,
+  type = "raw")
+
+plot(var_importance_ranger_after_vi)
+```
+
+```{r}
+var_importance_ranger_after_vi
+```
+
+```{r}
+model_parts <-model_parts(rf_explainer)
+model_parts
+
+```
+```{r}
+plot(model_parts, max_vars=10)
+```
+
+```{r}
+pdp <- model_profile(rf_explainer)
+```
+
+```{r}
+plot(pdp, variables="ComEstRes")
+
+```
+
+```{r}
+plot(pdp, variables= "Economic.Activity..2011.Census..Unemployment.Rate")
+
+```
+
+
+```{r}
+plot(pdp, variables="House.Prices.Sales.2008")
+```
+
+
+```{r}
+plot(pdp, variables="Tenure..2011..Owned..Owned.outright"
+)
+
+```
+
+```{r}
+plot(pdp, variables="Low.Birth.Weight.Births..2007.2011..LCL...Lower.confidence.limit"
+)
+
+```
+
+
+```{r}
+
+drop<- c("RPDBurglary")
+test<- test[,!(names(test) %in% drop)]
+
+
+pred = predict(rf, newdata=test)
+
+
+```
+```{r}
+test$Predictions<-pred
+test
+```
+
+```{r}
+
+
+sqrt(sum(pred - test$RPDBurglary)^2) #RMSE
+
+
+```
+
+```{r}
+ggplot(test, aes(x=RPDBurglary, y=Predictions)) + geom_point()
+
+```
+
+
