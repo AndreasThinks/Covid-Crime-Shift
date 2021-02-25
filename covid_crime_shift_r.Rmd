@@ -3,9 +3,11 @@ title: "Learning R - Exploring the COVID Crime Effect in London"
 output: html_notebook
 ---
 ## Exploring Predictors of COVID Crime Shifts
-The lockdown and social distancing measures that were brought in throughout the world to tackle COVID in 2020 have had a significant, widespread effect on crime. In this notebook, I use public London crime data on robbery and burglary to examine where this "COVID crime shift" was strongest, and whether any specific drivers or correlates can be identified.
+The lockdown and social distancing measures that were brought in throughout the world to tackle COVID in 2020 have had a significant, widespread effect on crime. In this notebook, I use public London crime data on robbery and burglary to examine where this "COVID crime shift" was strongest, and whether any specific drivers or correlates can be identified.  
 
-The primary purpose of this exercise was to learn R - I've previously worked entirely in Python, which is more than sufficient 99% of the time, but has at times proved a blocker when I want to tackle some more experimental geospatial methods or tools geared towards the academic community.  With that in mind, this is likely to be a little messy, and I'll aim to condense my main lessons into a blog post in the future.
+Our findings suggest that the relative change in burglary and robbery trends during "lockdown" in April and May 2020 was heavily affected by local characteristics: areas with a high residential population saw teh sharpest decreases in burglary (likely due to a reduction in available targets) while the reduction in robberies instead seem to be driven by geographic features and proxy indicators of deprivation (potentially suggesting more available targets for robbery in communities least able to work for from).
+
+The primary purpose of this exercise was to learn R - I've previously worked entirely in Python, which is more than sufficient 99% of the time, but has at times proved a blocker when I want to tackle some more experimental geospatial methods or tools geared towards the academic community.  With that in mind, this is likely to be a little messy, and I'll aim to condense my main lessons into a blog post in the future. The models are not heavily tuned (aiming to explore correlates rather than provide accurate predictions) and certain predictors are likely to correlate with each other, and as such likely do not imply direct causations.
 
 #### Resources I've used
 - Matt Ashby Crime Mapping course: https://github.com/mpjashby/crimemapping/
@@ -20,7 +22,7 @@ The primary purpose of this exercise was to learn R - I've previously worked ent
 1. Ingest burglary and robbery data and assign to MSOA
 2. Predict trend by MSOA
 3. Identify COVID effect/error by MSOA
-4. Visualise and model
+4. Model
 
 ### Data
 In this exercise, I'm using three years of Metropolitan Police Service data from data.police.uk - I've downloaded these manually rather than using their API.
@@ -45,6 +47,9 @@ library(tmap)
 library(RColorBrewer) 
 # More colour palettes
 library(viridis)
+#ggplot organiastion
+library(ggpubr)
+
 
 library(raster)  # raster data
 library(rgdal)  # input/output, projections
@@ -56,6 +61,17 @@ library(lubridate) #date and time
 #random forest and metrics
 library(Metrics)
 library(caret)
+library(randomForest)
+require(caTools)
+library(DALEX)
+library(dplyr)
+
+
+
+#correlation matrix
+library(corrr)
+
+
 
 ```
 
@@ -336,6 +352,7 @@ burglaryExplore
 
 Looking at the aggregate counts of burglary across London, a visual observation suggests yearly trends (which we'll have to consider in our forecast), which sharp peaks during the Winter months and the lowest numbers in summer (when the days are longest).
 ```{r}
+#group burglary count by months and plot
 burglary_by_month <- burglaryExplore %>%
   group_by(DateClean) %>%
   summarize(total_burglaries = sum(count_by_msoa))
@@ -344,7 +361,7 @@ ggplot(burglary_by_month, aes(x=DateClean, y=total_burglaries)) +
   geom_line()
 ```
 
-To observe how crime counts are distributed in space, let's map both counts by MSOA. As we previously mentioned, MSOAs are designed to be comparable units, at least from a population perspective - we don't need to produce per population rates. 
+To observe how crime counts are distributed in space, let's map both counts by MSOA. As  previously mentioned, MSOAs are designed to be comparable units, at least from a population perspective - we don't need to produce per population rates. 
 
 
 ```{r, fig.width = 13}
@@ -352,11 +369,13 @@ burglary_by_msoa <- burglaryExplore %>%
   group_by(MSOA11CD) %>%
   summarize(total_burglaries = sum(count_by_msoa))
 
+#we join our burglary counts to their geographic msoa
 burglary_map <- left_join(lsoa_borders, burglary_by_msoa, by = "MSOA11CD")
 
+#user brewer colour palette https://colorbrewer2.org
 pal <- brewer.pal(5,"BuGn")
 
-
+#create our map, and add the layout options
 burglary_map <-tm_shape(burglary_map) +
   tm_fill(col = "total_burglaries", title = "Total Burglary Count by MSOA", style="quantile", palette="BuGn") +
   tm_layout(legend.outside = TRUE, legend.outside.position = "right")
@@ -380,10 +399,12 @@ robbery_map <-tm_shape(robbery_map) +
   tm_fill(col = "total_robberies", title = "Total Robbery Count by MSOA", style="quantile", palette="BuGn") +
   tm_layout(legend.outside = TRUE, legend.outside.position = "right")
 
+
+#arrange the maps together
 tmap_arrange(burglary_map, robbery_map, nrow = 2)
 ```
 
-We notice that robbery is noticeably more concentrated in central London, with burglary remaining quite common accross the city. That said, there are also obvious spatial patterns here - these crimes are clustered in certain geographies. 
+We notice that robbery is noticeably more concentrated in central London, with burglary remaining quite common across the city. That said, there are also obvious spatial patterns here - these crimes are clustered in certain geographies. 
 
 #### Modelling 
 We can now begin the forecasting process. To design our process, we'll start by focusing on a single MSOA - the first in our dataset, [E02000001, or the City of London.](https://findthatpostcode.uk/areas/E02000001.html)
@@ -391,6 +412,7 @@ We can now begin the forecasting process. To design our process, we'll start by 
 ```{r}
 single_msoa_df <- filter(empty_df, MSOA11CD == "E02000001" & Crime.type=="Burglary")
 
+#we add a 01 to our date to ensure R recognises the date format
 single_msoa_df$DateString <- paste(single_msoa_df$Month, "-01")
 
 
@@ -414,7 +436,7 @@ training_df <- tibble(
 training_df
 ```
 
-```{r, hide}
+```{r, results='hide'}
 library(prophet)
 m <- prophet(training_df)
 
@@ -422,6 +444,7 @@ m <- prophet(training_df)
 For now, we'll forecast on a 6 month horizon - we obviously wouldn't expect it to be accurate that far into the future.
 
 ```{r}
+#prophet generates a future dataframe using our data, for 6 mperiods
 future <- make_future_dataframe(m, periods = 6, freq = 'month')
 
 
@@ -594,6 +617,19 @@ msoa_error_tibble
 
 Our process has completed: we have a "COVID shift" measure for all of London.
 
+## 3. Measuring Local COVID Crime Shifts
+
+We now need to use our forecasts to measure the "error" - this should provide an indication of the "COVID Crime Shift", or how much the actual crime diverted from the previous forecasts.
+
+I explored various avenues for this: the ideal solution would be a relative rate of the error, as MSOAs with large crime numbers will likely generate large errors, and so a rate would be ideal, though this is complicated by our erratic prediction and mix of positive and negative numbers.
+
+Our final solution has explored two options:
+- the absolute error number
+- the relative error once the crime and predictions have been transformed (by adding 50)
+
+We visualise and describe these statistics first to ensure they appear sensible.
+
+
 ```{r}
 #write_csv(msoa_error_tibble, "msoa_error_table2.csv")
 ```
@@ -611,11 +647,6 @@ msoa_error_tibble <- left_join(msoa_error_tibble, burglary_by_msoa, by = "MSOA11
 
 ```
 
-To meaningfully compare these rates, we calculate the ["Relative Percentage Difference"](https://sciencing.com/calculate-rpd-7513822.html) - it struggles to cope with values near 0, but is a useful tool to measure changes in relative numbers that may be negative.
-
-Let's also add our total burglary and robbery numbers, as these might be useful predictors, convert to numeric items. Let's also calculate the "Relative Percentage Difference" (RPD) of our estimates - this gives us a useful method for calculating rate of change even though there are 0s. 
-
-
 
 ```{r}
 
@@ -623,167 +654,173 @@ msoa_error_tibble$RPDBurglary <- (msoa_error_tibble$burglaryActual - msoa_error_
 
 msoa_error_tibble$RPDRobbery <- (msoa_error_tibble$robberyActual - msoa_error_tibble$robberyPredicted)/((msoa_error_tibble$robberyPredicted + msoa_error_tibble$robberyActual)/2)
 
-msoa_error_tibble
+msoa_error_tibble$robberyActualShifted <- msoa_error_tibble$robberyActual + 50
+msoa_error_tibble$robberyPredictedShifted <- msoa_error_tibble$robberyPredicted + 50
+
+
+msoa_error_tibble$RPDRobberyShifted <- (msoa_error_tibble$robberyActualShifted - msoa_error_tibble$robberyPredictedShifted)/((msoa_error_tibble$robberyPredictedShifted + msoa_error_tibble$robberyActualShifted)/2)
+
+msoa_error_tibble$burglaryActualShifted <- msoa_error_tibble$burglaryActual + 50
+msoa_error_tibble$burglaryPredictedShifted <- msoa_error_tibble$burglaryPredicted + 50
+
+
+msoa_error_tibble$RPDburglaryShifted <- (msoa_error_tibble$burglaryActualShifted - msoa_error_tibble$burglaryPredictedShifted)/((msoa_error_tibble$burglaryPredictedShifted + msoa_error_tibble$burglaryActualShifted)/2)
+
 
 ```
 
 ```{r}
-summary(vis_df$burglaryError)
-```
-```{r}
-ggplot(vis_df, aes(x=burglaryError)) + geom_histogram()
+print("Burglary Error")
+summary(msoa_error_tibble$burglaryError)
+print("Burglary Relative Error")
+summary(msoa_error_tibble$RPDburglaryShifted)
+print("Robbery Error")
+summary(msoa_error_tibble$robberyError)
+print("Robbery Relative Error")
+summary(msoa_error_tibble$RPDRobberyShifted)
 
 ```
+As we can see, the average London MSOA experienced a negative COVID crime shift for both burglary and robbery, but this is far from equally distributed - at the extremes, some areas actually see large increases on our predicted values. 
 
-```{r}
-summary(vis_df$robberyError)
+```{r , fig.width = 13}
+
+burg_hist <- ggplot(msoa_error_tibble, aes(x=burglaryError)) + geom_histogram()
+rob_hist <-ggplot(msoa_error_tibble, aes(x=robberyError)) + geom_histogram()
+burg_r_hist <- ggplot(msoa_error_tibble, aes(x=RPDburglaryShifted)) + geom_histogram()
+rob_r_hist <- ggplot(msoa_error_tibble, aes(x=RPDRobberyShifted)) + geom_histogram()
+scatter <- ggplot(msoa_error_tibble, aes(x = RPDRobberyShifted, y = RPDburglaryShifted)) +
+  geom_point()
+
+r_scatter <- ggplot(msoa_error_tibble, aes(x = robberyError, y = burglaryError)) +
+  geom_point()
+
+ggarrange(rob_hist, burg_hist, rob_r_hist, burg_r_hist,scatter, r_scatter, ncol=2, nrow=3 )
+
+
 ```
-```{r}
+Our shifted relative error rate seems to function as intended: while there are still outliers, they are more concentrated than they are for the pure error term, and the overall distribution is more focused, while still indicating the direction and relative strength of our COVID effect.
 
-ggplot(vis_df, aes(x=robberyError)) + geom_histogram()
+Let's map this effect visually, and see if any particular areas stand out.
 
-```
-
-
-
-```{r}
-ggplot(vis_df, aes(x = robberyError, y = burglaryError)) +
-    geom_point()
-```
-
-
-Now, let's link all these back to our original geographic dataframe (and fix my MSOA typo again)
-
-```{r, hide}
+```{r , fig.width = 13}
+#re-ingest our geographic MSOA borders
 msoa_borders <- st_read("msoa_borders/MSOA_2011_London_gen_MHW.tab", crs=27700)
 
 geographic_error_map <- left_join(msoa_borders, msoa_error_tibble, by = "MSOA11CD")
-```
-Let's map both of these metrics, and see what it looks like.
-```{r}
-
-# map
-
 
 burg_map <- tm_shape(geographic_error_map) +
-  tm_fill(col = "robberyError", title = "Robbery Error", palette="-RdBu", midpoint = NA, breaks=c(-2,-1,0,1,2,3))+
+  tm_fill(col = "robberyError", title = "Robbery Error", palette="-PuOr")+
   tm_layout(legend.outside = TRUE, legend.outside.position = "right")
 rob_map <-tm_shape(geographic_error_map) +
-  tm_fill(col = "burglaryError", title = "Burglary  Error", palette="-RdBu", midpoint = NA,breaks=c(-3,-2,-1,0,1,2,3))+
+  tm_fill(col = "burglaryError", title = "Burglary  Error", palette="-PuOr")+
   tm_layout(legend.outside = TRUE, legend.outside.position = "right")
 
 
-tmap_arrange(burg_map, rob_map, nrow = 2)
-```
-
-```{r , fig.width = 13}
-# map
-
-
-burg_map <- tm_shape(geographic_error_map) +
-  tm_fill(col = "robberyError", title = "Robbery Error", palette="-RdBu", midpoint = NA, breaks=c(-25,-10,-5,0,5,10,25))+
+burg_map_rate <- tm_shape(geographic_error_map) +
+  tm_fill(col = "RPDRobberyShifted", title = "Robbery Error Relative", palette="-PuOr")+
   tm_layout(legend.outside = TRUE, legend.outside.position = "right")
-rob_map <-tm_shape(geographic_error_map) +
-  tm_fill(col = "burglaryError", title = "Burglary  Error", palette="-RdBu", midpoint = NA,breaks=c(-25,-10,-5,0,5,10,25))+
+rob_map_rate <-tm_shape(geographic_error_map) +
+  tm_fill(col = "RPDburglaryShifted", title = "Burglary  Error Relative", palette="-PuOr")+
   tm_layout(legend.outside = TRUE, legend.outside.position = "right")
 
 
-tmap_arrange(burg_map, rob_map, nrow = 2)
+tmap_arrange(burg_map, rob_map, burg_map_rate, rob_map_rate , nrow = 2, ncol=2)
 
 ```
+It's hard to identify any obvious effect visually, but we do notice that while central London sees some very strong reductions, it also sees some increases.  Conversely, the outskirts of London (notably to the south and West) are a near continuous area of large decreases. The effect does vary by offence type, but the pattern seen in South and West London appears broadly consistent.
 
-As a final part of this project, I'm going to explore some geographic modelling. Let's start with linking our current data with the London MOPAC MSOA Atlas, which should provide a whole bunch of useful demographic and economic data.  I've slightly modified it in Excel to get rid of the weird header structure.
+## 4. Identifying Correlates and Modelling
+
+We've identified that the COVID crime effect was felt unequally accross London, and varies by offence type. To finalise our project, we will be linking our data to [demographic data provided by MOPAC](https://data.london.gov.uk/dataset/msoa-atlas), and aiming to use it to identify correlates to our "covid shift", and hopefully build models disentangling the effect.
 
 ```{r}
 library(readxl)
+#ingest ATLAS
 msoa_atlas <- read_excel("msoa_atlas/msoa-data.xls")
-msoa_atlas
-```
 
-Let's do one last spatial join to bring all these things together
-
-
-
-```{r}
+#join by MSOA
 geographic_msoa_matrix <- left_join(geographic_error_map, msoa_atlas, by = "MSOA11CD")
 
+#convert to tibble
 msoa_matrix_tbl <- as_tibble(geographic_msoa_matrix)
 write_csv(msoa_matrix_tbl, "msoa_matrix.csv")
 
-msoa_matrix_tbl
-```
 
-
-Let's look at how correlated our factors are
-
-```{r, hide}
-library(corrr)
-#corr_df <- correlate(msoa_matrix_tbl, quiet = TRUE)
-#corr_df
-```
-
-Annoyingly, unlike Pandas, R throws up errors here (while Python implicitly gets rid of non-numerical columns - let's clean it up
-
-```{r}
+#select only numeric data
 msoa_matrix_numeric <-dplyr::select_if(msoa_matrix_tbl, is.numeric)
 msoa_matrix_numeric
-
 ```
+Having now ingested and linked our data, we begin by exploring the factors most highly correlated with our relative error rates.
 
-
-```{r}
-
+```{r, results='hide'}
 
 corr_df <- correlate(dplyr::select_if(msoa_matrix_tbl, is.numeric), quiet = TRUE)
-corr_df
 
-
-```
-Let's now look for correlates of our error rate for burglary and robbery
-
-```{r}
 options(scipen=999)
-
-
-dplyr::select(corr_df[order(corr_df$robberyError),] , term, robberyError)
-
 ```
-
+Starting by our relative robbery error, a few interesting correlates stand out:
+- road traffic casualties
+- burglary numbers
+- the number of dwellings with no usual residents, and the number of commercial residents
+- households with no cars
+- the age composition of the area
+- general deprivation indicators (such as the proportion of households with central heating)
 
 ```{r}
-dplyr::select(corr_df[order(corr_df$burglaryError),] , term, burglaryError)
+#show only correlates with an absolute value higher than 0.2
+#filter(dplyr::select(corr_df[order(corr_df$RPDRobberyShifted),] , term, RPDRobberyShifted), RPDRobberyShifted < -0.2 | RPDRobberyShifted > 0.2)
+#filter(dplyr::select(corr_df[order(corr_df$RPDRobberyShifted),] , term, RPDRobberyShifted), RPDRobberyShifted < -0.2 | RPDRobberyShifted > 0.2)
+high_corr_rob <- filter(dplyr::select(corr_df, term, RPDRobberyShifted), RPDRobberyShifted < -0.15 | RPDRobberyShifted > 0.15)
+
+high_corr_rob[order(high_corr_rob$RPDRobberyShifted),]
+
 ```
-There are very few decent correlates in the robbery data - everything is a bit of a mess.  That's not the case in the burglary data however: we might be able to do some modeling here. General deprivation indicators stand out very sharply, correlated to ethnicity.
-
-There is quite a good correlation between robbery rates and robbery RPD.  That is *not* the case for burglary, which is interesting.
-
-I'd normally start exploring spatial models and weights, but I think that's a little outside the scope of this first project.  Instead, let's get straight to modeling.
-
-
+The correlations for burglary are weaker - only a few have an absolute value higher than 0.2 - but a few stand out:
+- households with no residents
+- high robbery numbers
+- house prices 
 
 ```{r}
 
+high_corr_burg <- filter(dplyr::select(corr_df, term, RPDburglaryShifted), RPDburglaryShifted < -0.15 | RPDburglaryShifted > 0.15)
 
+high_corr_burg[order(high_corr_burg$RPDburglaryShifted),]
+
+```
+These correlates suggest we can model this shift - this is likely to prove more reliable for robbery (where the correlations are stronger), and seem linked to usual resident population(as measured by household composition), deprivation (through various proxy indicators such as central heating presence or housing type), and general crime patterns (through total burglary and robbery numbers)
+
+We will take two approaches for modelling: a simple regression (to identify strong links) and random forest regressors (to identify non-linear associations)
+
+### Simple Regression
+
+We begin through the use of simple OLS regression. This is a linear model that has large limitations for modelling complex relationships, but can be an effective first step, effectively with a few transformations.
+
+R does not cope well with blank spaces in terms, so we'll extract and rename our key correlates.
+
+```{r}
+
+#make copy of df and rename 
 
 msoa_copy <- msoa_matrix_numeric
 
 names(msoa_copy)[names(msoa_copy) == "Dwelling type (2011) Household spaces with no usual residents"] <- "DwellingNoResidents"
-names(msoa_copy)[names(msoa_copy) == "Road Casualties 2012 2012 Total"] <- "RoadCasualties"
+names(msoa_copy)[names(msoa_copy) == "House Prices Median House Price (£) 2010"] <- "MedianHousePrice"
 names(msoa_copy)[names(msoa_copy) == "Dwelling type (2011) Flat, maisonette or apartment"] <- "FlatAprt"
-names(msoa_copy)[names(msoa_copy) == "Mid-year Estimates 2012, by age % 0 to 14"] <- "PercentUnderFourteenPercent"
+names(msoa_copy)[names(msoa_copy) == "Qualifications (2011 Census) Schoolchildren and full-time students: Age 18 and over"] <- "fullTimeStudents"
 names(msoa_copy)[names(msoa_copy) == "Car or van availability (2011 Census) No cars or vans in household"] <- "NoCars"
+names(msoa_copy)[names(msoa_copy) == "Ethnic Group (2011 Census) Other ethnic group"] <- "OtherEthnicGroup"
 names(msoa_copy)[names(msoa_copy) == "Central Heating (2011 Census) Households with central heating (%)"] <- "CentralHealingPercent"
 
 
 
 ```
-Let's bring all our key indicators togehter in one dataframe, and get rid of any NA rows.
+Let's now extract these to a separate dataframe, remove any missing values, and provide some quick summary statistics to identify any obvious concerns.
 
 ```{r}
 
-feature_df <- dplyr::select(msoa_copy, burglaryError, robberyError, total_burglaries, total_robberies, DwellingNoResidents, RoadCasualties, FlatAprt, PercentUnderFourteenPercent, NoCars, CentralHealingPercent, AvHholdSz, ComEstRes)
+feature_df <- dplyr::select(msoa_copy, RPDburglaryShifted, RPDRobberyShifted, total_burglaries, total_robberies, DwellingNoResidents, MedianHousePrice, FlatAprt, fullTimeStudents, NoCars, OtherEthnicGroup, CentralHealingPercent, AvHholdSz, ComEstRes)
 
-feature_df <- drop_na(feature_df, burglaryError, robberyError)
+feature_df <- drop_na(feature_df, RPDburglaryShifted, RPDRobberyShifted)
 feature_df
 ```
 ```{r}
@@ -795,21 +832,24 @@ summary(feature_df)
 
 colSums(is.na(feature_df))
 ```
-
+As a quick initial exercise, we'll create  a scatter plot of the interaction between each and every one of our variables. This will probably be too messy to make any real findings, but can serve to quickly highlight strong associations.
 
 ```{r, fig.width = 13}
 pairs(feature_df)
 
 ```
+As we hoped, some obvious relationships stand out: for instance, the presence of apartments, and households with no cars, or central heating and average household size.
 
-We are going to want to perform a log transform.  Because our RPD has negative values, we'll need to add a constant before - in this case, 4 (so everything is positive).  We'll also transform our commercial residents and road traffic. Now, let's produce our log transform columns
+Our robbery and burglary data and change rates are densely clustered - they're unlikely to cleanly associate with anything. With that in mind, we'll perform a log transformation. This cannot be undertaken with negative values, so once again we'll perform a shift (of 2) for both of our relative error numbers, as well as a commercial resident column, before log transforming our features.
+
+
 
 
 ```{r}
-feature_df$BurglaryErrTranform <- feature_df$burglaryError + 500
-feature_df$RobberyErrTranform <- feature_df$robberyError + 500
+feature_df$BurglaryRPDTranform <- feature_df$RPDburglaryShifted    + 2
+feature_df$RobberyRPDTranform <- feature_df$RPDRobberyShifted   + 2
 
-feature_df$ComEstResTranform <- feature_df$ComEstRes   + 500
+feature_df$ComEstResTranform <- feature_df$ComEstRes   + 2
 
 
 for (col in colnames(feature_df)){
@@ -819,42 +859,32 @@ for (col in colnames(feature_df)){
 ```
 ```{r}
 
-drop<- c("log_burglaryError","log_robberyError", "log_ComEstRes")
+drop<- c( "log_ComEstRes", "log_RPDburglaryShifted", "log_RPDRobberyShifted")
 feature_df<- feature_df[,!(names(feature_df) %in% drop)]
 
-colSums(is.na(feature_df))
 
 
 ```
-Let's now select only our log transformed variables.
 
-```{r}
-feature_df
-```
-
-```{r}
-feature_df[,16:27]
-```
 
 
 ```{r}
 
-feat_transform_df <- feature_df[,16:27]
-orig_feat_df <- feature_df[,0:16]
+feat_transform_df <- feature_df[,17:29]
+orig_feat_df <- feature_df[,0:17]
 
-
-#feat_transform_df <- feature_df[,17:28]
-
-
-colSums(is.na(feature_df))
 
 ```
+We've now separated a separate dataframe where each value has been log transformed - while this isn't hugely rigorous (and would benefit from inspecting the relationships in more detail) it serves our immediate purpose.
 
 ```{r, fig.width = 13}
 pairs(feat_transform_df)
 
 ```
 
+While we've introduced a bit of noise, we've also "forced" some of our variables into relationships that look semi linear. 
+
+To dig into this deeper, let's create a correlation matrix for our entire transformed dataframe.
 
 ```{r}
 correlate(feat_transform_df)
@@ -862,73 +892,95 @@ correlate(feat_transform_df)
 
 ```
 
-Let's start with burglary
+To provide a visual aid, I've extracted the column for our robbery relative change rate, and sorted the table accordingly.
 
 
 ```{r}
-dplyr::select(correlate(feat_transform_df)[order(correlate(feat_transform_df)$log_BurglaryErrTranform),], term, log_BurglaryErrTranform)
+dplyr::select(correlate(feat_transform_df)[order(correlate(feat_transform_df)$log_BurglaryRPDTranform),], term, log_BurglaryRPDTranform)
 ```
+### Regression
+Now that we've transformed our data, cleaned it up, and identified potential correlates, let's build our linear model. 
+
+There are various automated tools for this process that seek to provide the highest fit and significance, but given the high degree of correlation between my chosen features, I've taken a more manual approach and tested a variety of models until I identified one with a suitable fit.  The final model is below.
 
 ```{r}
-mod_burglary <- lm(log_BurglaryErrTranform ~ log_total_burglaries , data = feat_transform_df)
+mod_burglary <- lm(log_BurglaryRPDTranform ~ log_total_burglaries + log_FlatAprt + log_MedianHousePrice  + log_ComEstResTranform, data = feat_transform_df)
 summary(mod_burglary)
 ```
 
-It looks like some combination of deprivation and the local area. The best model so far is below.
+Our model suggests the largest burglary decrease linked to lockdown was in MSOAs which a high level of historic burglary. The composition of housing/accomodation and area type also seems to play a role, with those areas with higher median house prices, and a larger number of commercial residents, seeing stronger decreases, while conversely areas with large number of apartments temper the effect.
+
+While all our variables are significant, the model is not a particularly good fit - the adjusted R2 is around 0.08, suggesting that less than 10% of the variance is accounted for by our model. I suspect more geographic features - such as distance from central London, more accurate footfall, or spatial lags - would probably be useful, but that's outside the scope of this project.
+
+Let's perform a similar exercise for robbery.
 
 ```{r}
-mod_burglary <- lm(log_BurglaryErrTranform ~ log_total_burglaries +log_DwellingNoResidents+ log_NoCars, data = feat_transform_df)
+dplyr::select(correlate(feat_transform_df)[order(correlate(feat_transform_df)$log_RobberyRPDTranform),], term, log_RobberyRPDTranform)
+```
+
+
+```{r}
+mod_burglary <- lm(log_RobberyRPDTranform ~ log_total_robberies  + log_total_burglaries + log_FlatAprt + log_CentralHealingPercent + log_fullTimeStudents, data = feat_transform_df)
 summary(mod_burglary)
 ```
-What about for robbery?
+
+This is a notably better fit than our burglary model, with our R2 suggesting we now account for over 20% of the variance. The nature of our predictors is also quite different: while we still see a negative relationship with historic crime (with areas of high historic crime experiencing larger relative decreases), there is a positive relationship with both the presence of apartments and central heating.
+
+I suspect some of these features are correlates of deprivation, so I want to create a quick scatter of three - for now we'll do it against median house price, which is definitely deprivation correlated.
+
 ```{r}
-dplyr::select(correlate(feat_transform_df)[order(correlate(feat_transform_df)$log_RobberyErrTranform),], term, log_RobberyErrTranform)
+
+heating <- ggplot(feature_df, aes(x = log_MedianHousePrice, y = log_CentralHealingPercent)) +
+  geom_point()+
+  geom_smooth(method=lm)
+
+apartments <- ggplot(feature_df, aes(x = log_MedianHousePrice, y = log_FlatAprt)) +
+  geom_point()+
+  geom_smooth(method=lm)
+
+comest <- ggplot(feature_df, aes(x = log_MedianHousePrice, y = log_ComEstResTranform)) +
+  geom_point()+
+  geom_smooth(method=lm)
+
+
+
+ggarrange(heating, apartments, comest, ncol=3, nrow=1 )
+
+
+
 ```
 
+While there does appear to be a relationship with some of these, it isn't strong - this suggests the factor's we have identified are significant not because of their association with deprivation and poverty, but because of what they mean about the specific characteristics of the area.
+
+### Random Forests
+
+Unlike regression, random forest doesn't really on any specific type of association - instead, we rely on computing power, repetition and iteration to capture the very best predictor for our variable, in any combination. 
+
+There are risks to this method: our sample size is smaller than I'd like, and this may lead to over-fit of outlier MSOAs.
+
+It does mean we don't need to worry about transformations or correlations: we can return to our original dataset, and let the model identify the strongest predictors.
+
 ```{r}
-mod_burglary <- lm(log_RobberyErrTranform ~ log_total_robberies  + log_CentralHealingPercent+ log_PercentUnderFourteenPercent, data = feat_transform_df)
-summary(mod_burglary)
-```
+# we remove rows where our main error is na or missing
+rf_msoa_matrix <- drop_na(msoa_matrix_numeric, RPDRobberyShifted)
 
-Let's use Random Forests to try and dig into this as bit further.
-
-Once again, let's get rid of NA.  This time, let's do our RPD, and then any columns
-```{r}
-rf_msoa_matrix <- drop_na(msoa_matrix_numeric, burglaryError)
-
+#then we repeat for any columns where value asre missing
 clean_rf_matrix <- rf_msoa_matrix[ , colSums(is.na(rf_msoa_matrix)) == 0]
-clean_rf_matrix
-```
-Right, we've now got our data good to go, with no NAs. 
-https://towardsdatascience.com/random-forest-in-r-f66adf80ec9
-
-```{r}
-
-library(randomForest)
-require(caTools)
-library(caret)
-library(DALEX)
-
-```
 
 
-```{r}
-drop<- c("burglaryActual","burglaryError","burglaryPercentError","burglaryPredicted","robberyActual","robberyPredicted","robberyError","robberyPercentError", "RPDBurglary", "RPDRobbery")
+#then we drop out any values that directly predict our error.
+
+drop<- c("burglaryActual","burglaryError","burglaryPercentError","burglaryPredicted","robberyActual","robberyPredicted","robberyError","robberyPercentError", "RPDBurglaryShifted", "RPDRobberyShifted")
+
+#remove out selected columns
 data<- clean_rf_matrix[,!(names(clean_rf_matrix) %in% drop)]
-data
-```
-Again, let's start with burglary. Annoyingly, because my columns have white spaces, R doesn't like it.
 
-```{r}
+
+#automatically remove white space and make names r compatbiel
 names(clean_rf_matrix)<-make.names(names(clean_rf_matrix),unique = TRUE)
 
-```
-
-
-```{r}
-
-#drop<- c("burglaryActual","burglaryPercentError","burglaryPredicted","robberyActual","robberyPredicted","robberyPercentError", "RPDBurglary", "RPDRobbery")
-drop<- c("burglaryPercentError","burglaryPredicted","robberyPredicted","robberyPercentError", "RPDBurglary", "RPDRobbery")
+drop<- c("burglaryActual","burglaryError","robberyActual","robberyError","RPDBurglary","RPDRobbery","robberyActualShifted","robberyPredictedShifted","burglaryActualShifted","burglaryPredictedShifted", "burglaryPredicted", "burglaryPercentError", "robberyPredicted", "robberyPercentError")
+#drop<- c("burglaryPercentError","burglaryPredicted","robberyPredicted","robberyPercentError")
 
 data<- clean_rf_matrix[,!(names(clean_rf_matrix) %in% drop)]
 
@@ -936,34 +988,40 @@ data<- clean_rf_matrix[,!(names(clean_rf_matrix) %in% drop)]
 names(data)<- make.names(names(data),unique = TRUE)
 data
 ```
-
+We start with modelling our relative rate of burglary shift. We divide our sample into a training set which we'll use to train the model, and a test set we'll use to verify accuracy and validity.
 
 ```{r}
-sample = sample.split(data$burglaryError, SplitRatio = 0.75)
+sample = sample.split(data$RPDburglaryShifted, SplitRatio = 0.7)
 train = subset(data, sample == TRUE)
 test  = subset(data, sample == FALSE)
 
 
 rf_burglary <- randomForest(
-  burglaryError ~ .,
+  RPDburglaryShifted ~ .,
   data=train, 
   importance=TRUE
 )
 
 summary(rf_burglary)
 ```
-We've now trained a model.  Let's now use the DALEX library to understand it, and see how it performs.
+```{r}
+#calculate our predictions and a  rmse
+prediction <-predict(rf_burglary, test)
+Metrics::rmse(test$RPDburglaryShifted, prediction)
+```
+
+While machine learning models were once considered opaque and difficult to interpret, several libraries now offer functionality to explain predictions. Here I use [DALEX](https://cran.r-project.org/web/packages/DALEX/index.html) to do just this. 
 
 ```{r}
 
-rf_explainer_burglary <- explain(rf_burglary, data=train, y= train$burglaryError)
+rf_explainer_burglary <- DALEX::explain(rf_burglary, data=train, y= train$RPDburglaryShifted)
 
 rf_perf_burg <- model_performance(rf_explainer_burglary)
 rf_perf_burg
 ```
+We can see that our model significantly outperforms our best linear models: the R2 suggests that almost 85% of the variance is correctly interpreted, and our rmse (root mean squared error) is around 0.2 on our test set.
 
-
-
+This model would be ill-suited to prediction or operationalising -it is a default forecast with no hyper-parameter tuning, and no consideration of error rates - but using tools like DALEX, we can identify which predictors the model identifies as most important. 
 
 ```{r, fig.width = 13}
 model_parts_burg <-model_parts(rf_explainer_burglary)
@@ -976,45 +1034,59 @@ model_parts_burg
 plot(model_parts_burg, max_vars=25)
 
 ```
+The three most important features our model highlights are:
+- the age composition of the population
+- the number of residents which are in commercial property
+- the historic number of burglaries
 
+This seems to corroborate our previous regression model. To further unpick  these trends, we can use Partial Dependence Plots to identify how the model prediction shifts with these values. 
 
 ```{r}
 pdp <- model_profile(rf_explainer_burglary)
+
 ```
+
+```{r}
+plot(pdp, variables="total_burglaries")
+
+```
+We still see a strong association between a high number of historic, and a large reduction during the lockdown period
+
+```{r}
+plot(pdp, variables= "Mid.year.Estimates.2012..by.age.0.4")
+
+```
+MSOAs with very large *very young* populations seem to have a less strong burglary lockdown decrease (though this is likely heavily associated to deprivation)
 
 ```{r}
 plot(pdp, variables="ComEstRes")
-
 ```
+```{r}
+hist(msoa_matrix_numeric$ComEstRes)
+```
+By combining the distribution of commercial residents by MSOA with our PDP, we can see that those MSOAs that are most densely populated by commercial residents see the smallest "covid decrease"(suggesting that those MSOAs that are very heavily residential saw the sharpest drops).
 
 ```{r}
-plot(pdp, variables= "Mid.year.Estimates.2012..by.age...0.to.14")
+plot(pdp, variables="House.Prices.Sales.2008")
 
 ```
 
+Finally, we can see that those areas that experienced the highest volume of house sales experienced the lowest relative decrease in burglary.
 
-```{r}
-plot(pdp, variables="Religion..2011..Religion.not.stated")
-```
+This highlights the importance of identifying correlates in RF models - especially in a dataset where features are highly interlinked, association does not imply causation, and we should be wary of over-interpreting.
 
-
-```{r}
-plot(pdp, variables="total_robberies")
-
-```
-
-Let's repeat the process for robbery
+We can now repeat our process for our robbery shift.
 
 
 ```{r}
 
-sample = sample.split(data$robberyError, SplitRatio = 0.75)
+sample = sample.split(data$RPDRobberyShifted, SplitRatio = 0.75)
 train = subset(data, sample == TRUE)
 test  = subset(data, sample == FALSE)
 
 
 rf_robbery <- randomForest(
-  robberyError ~ .,
+  RPDRobberyShifted ~ .,
   data=train, 
   importance=TRUE
 )
@@ -1026,7 +1098,7 @@ We've now trained a model.  Let's now use the DALEX library to understand it, an
 
 ```{r}
 
-rf_explainer_robbery <- explain(rf_robbery, data=train, y= train$robberyError)
+rf_explainer_robbery <- DALEX::explain(rf_robbery, data=train, y= train$RPDRobberyShifted)
 
 rf_perf_rob <- model_performance(rf_explainer_robbery)
 rf_perf_rob
@@ -1049,7 +1121,7 @@ pdp_rob <- model_profile(rf_explainer_robbery)
 ```
 
 ```{r}
-plot(pdp_rob, variables="Road.Casualties.2011.2011.Total")
+plot(pdp_rob, variables="total_robberies")
 
 ```
 
@@ -1058,12 +1130,27 @@ plot(pdp_rob, variables="total_burglaries")
 
 ```
 
+The effect of historic crime effects again appears like a reliable predictor of a robbery covid shift: those MSOAs with the highest number of burglaries and robberies see strong decreases in robbery (though the association with burglary is not clear cut, suggesting other interaction effects may be driving this)
+
 ```{r}
-plot(pdp_rob, variables="Household.Composition..2011..Percentages.One.person.household")
+plot(pdp_rob, variables="Road.Casualties.2011.2011.Total")
 
 ```
+Road casualties is another strong relationship. This could be a proxy for deprivation, but I suggest this is more down to geographic features - road casualties are probably rarer in denser urban environments, most likely to be affected by lockdown.
 
 ```{r}
 plot(pdp_rob, variables="Ethnic.Group..2011.Census..Other.ethnic.group....")
+```
+```{r}
+hist(data$Ethnic.Group..2011.Census..Other.ethnic.group....)
 
 ```
+
+
+Finally, we see a demographic predictor linked to "other ethnic group". I'm not clear how to interpret this, but it suggests that those MSOAs that are most diverse (and have the largest representation by these ethnic groups) experienced the strongest decreases in robbery during lockdown. 
+
+Together, these analyses suggest that the crime drop for robbery and burglary during national lockdown was significantly affected by distinct local factors. For both offences, historical crime trends play a role, with high crime areas experiencing a relatively larger drop in both burglary and robbery.
+
+Beyond that, the drivers vary for each offence  type: burglary was driven by the composition of the residential population, with heavily residential areas, and areas with a relatively "stable" population as measured by low housing sales also saw larger decrease - this is likely due to the increased number of empty residential properties.
+
+Robbery decreases conversely, are well associated with high numbers of road casualties, as well as the ethnic makeup of the local population - this is likely due to an association with denser, more urban areas, with lower street speeds, and a possible link to deprivation, whereby minority population were least able to work from home, and were likely to still present as available targets for robbery.
